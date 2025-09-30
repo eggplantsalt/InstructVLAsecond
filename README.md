@@ -30,9 +30,7 @@
   </a>
 </p>
 
-<p align="center">
-  <h5 align="center"><strong>25/9/15: We are updating the code. For any issues, please pull the latest version before reporting bugs. </strong></h5>
-</p>
+
 
 
 
@@ -134,6 +132,12 @@ conda install conda-forge::libvulkan-loader
 
 **1. LIBERO**: 
 
+***Notice:*** Several LIBERO dependencies require different version, we recommend that you create a new conda environment to evaluate on the LIBERO benchmark.
+```bash
+conda create --name instructvla_libero --clone instructvla
+conda activate instructvla_libero
+```
+
 Clone and install the LIBERO repo:
 
 ```bash
@@ -146,12 +150,16 @@ Additionally, install other required packages:
 
 ```bash
 cd deploy/libero
-pip install -r experiments/robot/libero/libero_requirements.txt
+pip install -r libero_requirements.txt
 ```
+
+
+
 
 **2. SimplerEnv and SimplerEnv-Instruct**: Clone the modified [ManiSkill2\_real2sim](https://github.com/YangS03/my_maniskill) under `InstructVLA/SimplerEnv`, then rename it to `ManiSkill2_real2sim`. Install both projects following their respective `README.md` files.
 
 ```bash
+conda activate instructvla
 
 rm SimplerEnv/ManiSkill2_real2sim
 
@@ -466,8 +474,8 @@ python -m torch.distributed.run \
 ```bash
 #!/bin/bash
 #SBATCH --job-name=VLA
-#SBATCH -p efm_t
-#SBATCH -N 8                         # number of nodes
+#SBATCH -p cluster_name
+#SBATCH -N 4                         # number of nodes
 #SBATCH --ntasks-per-node=1          # crucial: 1 task per dist per node
 #SBATCH --cpus-per-task=128          # number of cores per task
 #SBATCH --gres=gpu:8                 # GPUs per node
@@ -526,6 +534,29 @@ Due to the RLDS shuffling mechanism, we suggest evaluating every 1.5k steps when
 2. Stage-2 (Generalist)
 
 ```bash
+#!/bin/bash
+#SBATCH --job-name=VLA
+#SBATCH -p cluster_name
+#SBATCH -N 8                         # number of nodes
+#SBATCH --ntasks-per-node=1          # crucial: 1 task per dist per node
+#SBATCH --cpus-per-task=128          # number of cores per task
+#SBATCH --gres=gpu:8                 # GPUs per node
+#SBATCH --output=trash/%x-%j.out
+#SBATCH -e trash/%x-%j.err
+
+export GPUS_PER_NODE=8
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+export MASTER_PORT=$((RANDOM % 101 + 20000))
+
+# NCCL configuration (must be set correctly on your cluster)
+export NCCL_SOCKET_IFNAME=TBD
+export NCCL_IB_HCA=TBD
+export NCCL_TIMEOUT=3600  # longer timeout for stable training
+
+# Fix for: libcudnn_ops_infer.so.8 link-time reference symbol error
+export LD_LIBRARY_PATH=~/miniconda3/envs/openvla/lib/python3.10/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH
+export LD_PRELOAD=~/miniconda3/envs/openvla/lib/python3.10/site-packages/nvidia/cudnn/lib/libcudnn_ops_infer.so.8
+
 srun --jobid $SLURM_JOBID bash -c 'python -m torch.distributed.run \
   --nproc_per_node $GPUS_PER_NODE --nnodes $SLURM_NNODES --node_rank $SLURM_PROCID \
   --master_addr $MASTER_ADDR --master_port $MASTER_PORT \
@@ -586,16 +617,19 @@ If you find our work helpful, please cite:
 ```bibtex
 
 @article{yang2025instructvla,
-  title={InstructVLA: Vision-Language-Action Instruction Tuning from Understanding to Manipulation},
+  title={Instructvla: Vision-language-action instruction tuning from understanding to manipulation},
   author={Yang, Shuai and Li, Hao and Chen, Yilun and Wang, Bin and Tian, Yang and Wang, Tai and Wang, Hanqing and Zhao, Feng and Liao, Yiyi and Pang, Jiangmiao},
   journal={arXiv preprint arXiv:2507.17520},
   year={2025}
 }
 
-@misc{2506.19816,
-  Author = {Hao Li and Shuai Yang and Yilun Chen and Yang Tian and Xiaoda Yang and Xinyi Chen and Hanqing Wang and Tai Wang and Feng Zhao and Dahua Lin and Jiangmiao Pang},
-  Title = {CronusVLA: Transferring Latent Motion Across Time for Multi-Frame Prediction in Manipulation},
-  Year = {2025},
-  Eprint = {arXiv:2506.19816},
-  }
+@article{li2025cronusvla,
+  title={CronusVLA: Transferring Latent Motion Across Time for Multi-Frame Prediction in Manipulation},
+  author={Li, Hao and Yang, Shuai and Chen, Yilun and Tian, Yang and Yang, Xiaoda and Chen, Xinyi and Wang, Hanqing and Wang, Tai and Zhao, Feng and Lin, Dahua and others},
+  journal={arXiv preprint arXiv:2506.19816},
+  year={2025}
+}
 ```
+
+## Acknowledgment <a name="citation"></a>
+  This project is partially supported by [OpenVLA](https://github.com/openvla/openvla), [Eagle](https://github.com/NVlabs/Eagle) and [CronusVLA](https://github.com/InternRobotics/CronusVLA). Thanks for their open-source contributions

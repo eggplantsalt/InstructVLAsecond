@@ -104,7 +104,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
-env/
+# env/
 venv/
 ENV/
 env.bak/
@@ -147,5 +147,5 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
-trash/
+
 bunny_dataset/
