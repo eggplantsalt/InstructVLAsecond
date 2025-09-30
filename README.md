@@ -471,6 +471,12 @@ python -m torch.distributed.run \
 
 **Multi-node pretraining (SLURM)**
 
+Multi-node training is supported via Slurm. First, create the log directory:
+```bash
+mkdir -p log # log/xx.out and log/xx.err will store the training log
+```
+Then submit the script with ***sbatch***:
+
 ```bash
 #!/bin/bash
 #SBATCH --job-name=VLA
@@ -479,8 +485,8 @@ python -m torch.distributed.run \
 #SBATCH --ntasks-per-node=1          # crucial: 1 task per dist per node
 #SBATCH --cpus-per-task=128          # number of cores per task
 #SBATCH --gres=gpu:8                 # GPUs per node
-#SBATCH --output=trash/%x-%j.out
-#SBATCH -e trash/%x-%j.err
+#SBATCH --output=log/%x-%j.out
+#SBATCH -e log/%x-%j.err
 
 export GPUS_PER_NODE=8
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
@@ -533,6 +539,11 @@ Due to the RLDS shuffling mechanism, we suggest evaluating every 1.5k steps when
 
 2. Stage-2 (Generalist)
 
+Multi-node training is supported via Slurm. First, create the log directory:
+```bash
+mkdir -p log # log/xx.out and log/xx.err will store the training log
+```
+Then submit the script with ***sbatch***:
 ```bash
 #!/bin/bash
 #SBATCH --job-name=VLA
@@ -541,8 +552,8 @@ Due to the RLDS shuffling mechanism, we suggest evaluating every 1.5k steps when
 #SBATCH --ntasks-per-node=1          # crucial: 1 task per dist per node
 #SBATCH --cpus-per-task=128          # number of cores per task
 #SBATCH --gres=gpu:8                 # GPUs per node
-#SBATCH --output=trash/%x-%j.out
-#SBATCH -e trash/%x-%j.err
+#SBATCH --output=log/%x-%j.out
+#SBATCH -e log/%x-%j.err
 
 export GPUS_PER_NODE=8
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)

@@ -147,5 +147,6 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+trash/
 
 bunny_dataset/
