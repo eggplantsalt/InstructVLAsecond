@@ -50,6 +50,9 @@ We kindly request that you import fastchat instead of copying this file if you w
 If you have changes in mind, please contribute back so the community can benefit collectively and continue to maintain these valuable templates.
 """
 
+# 说明：本文件在 InstructVLA 中承担“提示词模板 + 多模态输入预处理 +
+# 语言模型损失加速”三类职责，是训练与推理共用的关键工具层。
+
 import dataclasses
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Type, Union, Tuple, Any, Sequence
@@ -63,6 +66,9 @@ def extract_decoder_hidden_states(
     hidden_layer_idx=-1,
 ):
     """
+    中文说明：
+    从 generate() 的返回对象中提取与最终序列对齐的 decoder hidden states。
+
     Extracts the decoder hidden states representation from
     GreedySearchEncoderDecoderOutput and BeamSearchEncoderDecoderOutput,
     associated with the `sequences` output.
@@ -162,7 +168,10 @@ class SeparatorStyle(IntEnum):
 
 @dataclasses.dataclass
 class Conversation:
-    """A class that manages prompt templates and keeps all conversation history."""
+    """对话模板管理器。
+
+    中文说明：统一维护 system/user/assistant 的消息格式与拼接规则。
+    """
 
     # The name of this template
     name: str
@@ -186,7 +195,7 @@ class Conversation:
     stop_token_ids: List[int] = None
 
     def get_prompt(self) -> str:
-        """Get the prompt for generation."""
+        """按当前 sep_style 生成最终 prompt 文本。"""
         system_prompt = self.system_template.format(system_message=self.system_message)
         if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
             ret = system_prompt + self.sep
@@ -449,7 +458,7 @@ conv_templates: Dict[str, Conversation] = {}
 
 
 def register_conv_template(template: Conversation, override: bool = False):
-    """Register a new conversation template."""
+    """注册对话模板。"""
     if not override:
         assert template.name not in conv_templates, f"{template.name} has been registered."
 
@@ -457,7 +466,7 @@ def register_conv_template(template: Conversation, override: bool = False):
 
 
 def get_conv_template(name: str) -> Conversation:
-    """Get a conversation template."""
+    """获取模板副本，避免原模板被原地修改。"""
     return conv_templates[name].copy()
 
 
@@ -565,6 +574,7 @@ def get_seq_frames(total_num_frames, desired_num_frames=-1, stride=-1):
     list: List of indices of frames to extract.
     """
 
+    # 二选一：要么指定采样帧数，要么指定步长，不能同时指定。
     assert desired_num_frames > 0 or stride > 0 and not (desired_num_frames > 0 and stride > 0)
 
     if stride > 0:
@@ -586,6 +596,7 @@ def get_seq_frames(total_num_frames, desired_num_frames=-1, stride=-1):
 
 
 def build_video_prompt(meta_list, num_frames, time_position=False):
+    """构造视频多帧提示词。"""
     # if time_position is True, the frame_timestamp is used.
     # 1. pass time_position, 2. use env TIME_POSITION
     time_position = os.environ.get("TIME_POSITION", time_position)
@@ -600,6 +611,10 @@ def build_video_prompt(meta_list, num_frames, time_position=False):
 
 
 def load_video(video_path, num_frames=64, frame_cache_root=None):
+    """视频读取与帧采样。
+
+    备注：当前仓库路径下该函数并未在主流程启用，保留为扩展接口。
+    """
     if isinstance(video_path, str):
         # video = decord.VideoReader(video_path)
         video = None
@@ -615,6 +630,7 @@ def load_video(video_path, num_frames=64, frame_cache_root=None):
 
 
 def load_image(image):
+    """统一图片加载入口，支持本地路径/base64/url/bytes/np_array。"""
     if isinstance(image, str) and os.path.exists(image):
         return Image.open(image)
     elif isinstance(image, dict):
@@ -636,6 +652,7 @@ def load_image(image):
 
 
 def build_transform(input_size, norm_type="imagenet"):
+    """构建图像预处理变换（resize + normalize）。"""
     if norm_type == "imagenet":
         MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
     elif norm_type == "siglip":
@@ -679,6 +696,7 @@ def find_closest_aspect_ratio_v2(aspect_ratio, target_ratios, width, height, ima
 
 
 def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
+    """动态切图：根据长宽比把图像切为若干 tile，适配视觉编码长度。"""
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
 
@@ -724,6 +742,7 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
 
 class ModelSpecificValues:
     def __init__(self, template, num_image_token):
+        """模型特定参数容器（模板名 + 每图 token 数）。"""
         self.template = template
         self.num_image_token = num_image_token
 
@@ -741,6 +760,7 @@ def prepare(
     IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
     llm_only=False,
 ):
+    """把历史对话与图像占位符组装为模型输入张量。"""
     if history is None and pixel_values is not None and "<image>" not in question:
         question = "<image>\n" + question
 
@@ -760,6 +780,7 @@ def prepare(
     query = template.get_prompt()
 
     for num_patches in num_patches_list:
+        # 把 <image> 占位符替换成真实图像 token 串。
         image_tokens = (
             IMG_START_TOKEN
             + IMG_CONTEXT_TOKEN * model_spec.num_image_token * num_patches
@@ -787,6 +808,10 @@ class EagleProcessor:
         max_input_tiles: int = 1,
         use_local_eagle_hg_model: bool = True,
     ):
+        """Eagle 模型处理器。
+
+        负责：tokenizer 初始化、图像切块规则、输入打包与标签构造。
+        """
         # This defaults use local eagle hg model card
         if model_path.endswith("/"):
             model_path = model_path[:-1]
@@ -822,6 +847,7 @@ class EagleProcessor:
         self.tokenizer.padding_side = "left"
 
     def scale_image_size_by(self, factor):
+        """按比例缩放视觉输入分辨率，同时同步 num_image_token。"""
         self.image_size = int(self.image_size * factor)
         self.model_spec.num_image_token = int(self.model_spec.num_image_token * factor**2)
         print(
@@ -829,15 +855,18 @@ class EagleProcessor:
         )
 
     def get_img_context_token(self, IMG_CONTEXT_TOKEN="<IMG_CONTEXT>"):
+        """返回图像上下文 token 的词表 ID。"""
         img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         return img_context_token_id
 
     def get_eos_token_id(self):
+        """返回当前模板下的结束符 token ID。"""
         template = get_conv_template(self.model_spec.template)
         eos_token_id = self.tokenizer.convert_tokens_to_ids(template.sep)
         return eos_token_id
 
     def prepare_input(self, params):
+        """推理时输入打包入口（不构建 labels）。"""
         system_message = params["prompt"][0]["content"]
         send_messages = params["prompt"][1:]
         max_input_tiles = self.max_input_tiles
@@ -886,6 +915,7 @@ class EagleProcessor:
 
         transform = build_transform(input_size=self.image_size, norm_type=self.norm_type)
         if len(pil_images) > 0:
+            # 动态限制 tile 数，防止总 token 超过上下文长度。
             max_input_tiles_limited_by_contect = self.max_input_tiles
             while True:
                 image_tiles = []
@@ -940,6 +970,7 @@ class EagleProcessor:
         IMG_END_TOKEN="</img>",
         IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
         ) -> Dict:
+        """训练时输入打包入口（构建 labels，并屏蔽非 assistant 目标）。"""
 
         system_message = params["prompt"][0]["content"]
         send_messages = params["prompt"][1:]
@@ -1029,11 +1060,11 @@ class EagleProcessor:
         tokens = self.tokenizer(query, return_tensors="pt")
         input_ids = tokens['input_ids'][0]
 
-        # Define the tokens for "assistant\n" and "<|im_end|>"
+        # assistant 起始标记与结束标记用于定位监督区间。
         assistant_tokens = self.tokenizer.encode("assistant\n")  # This will give [77091, 198]
         end_token = self.tokenizer.encode("<|im_end|>")[0]
 
-        # Initialize the labels with -100 (to mask out)
+        # 默认全部 mask，后续仅放开 assistant 回答区间。
         labels = input_ids.clone()
         mask = torch.ones_like(input_ids, dtype=bool)
 
@@ -1058,10 +1089,12 @@ class EagleProcessor:
         )
 
     def post_process(self, generation_output):
+        """把生成 token 解码为文本。"""
         all_responses = self.tokenizer.batch_decode(generation_output, skip_special_tokens=True)
         return all_responses
 
     def collate_fn(self, all_examples):
+        """批量拼接推理输入。"""
         pixel_values_list = [ex["pixel_values"] for ex in all_examples]
         input_ids_list = [ex["input_ids"] for ex in all_examples]
         attention_mask_list = [ex["attention_mask"] for ex in all_examples]
@@ -1095,6 +1128,7 @@ class EagleProcessor:
 
 
 def reshape_model_embeddings(model, factor):
+    """调整视觉 position_ids 长度，适配图像 token 数变化。"""
     module = model.vision_model.vision_model.embeddings
     num_pos = module.num_positions * factor**2
     curr_dtype = module.position_ids.dtype
@@ -1117,6 +1151,7 @@ def get_embeddings(
     visual_features=None,
     output_hidden_states=None,
 ) -> torch.LongTensor:
+    """把视觉特征写回 <IMG_CONTEXT> 位置，得到融合后的语言隐表示。"""
     assert self.img_context_token_id is not None
     assert pixel_values is not None
     if visual_features is not None:
@@ -1147,7 +1182,7 @@ def get_embeddings(
 
 import functools
 
-# fixed in https://github.com/huggingface/peft/pull/2761
+# 修复 X-LoRA pre-hook 累积问题。
 def cleanup_xlora_pre_hooks(model, verbose=False):
     cleaned = 0
     for _, m in model.named_modules():
@@ -1174,6 +1209,7 @@ def fixed_cross_entropy(
     ignore_index: int = -100,
     **kwargs,
 ) -> torch.Tensor:
+    """交叉熵包装，保留与 HF 接口兼容的签名。"""
     loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction="mean")
     return loss
 
@@ -1187,6 +1223,7 @@ def ForCausalLMLoss(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    """Causal LM loss 计算（支持直接传入 shift_labels）。"""
     # Upcast to float if we need to compute the loss to avoid potential precision issues
     logits = logits.float()
 
@@ -1208,7 +1245,7 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen2.modeling_qwen2 import KwargsForCausalLM
 from transformers.processing_utils import Unpack
 
-# A customized language model forward with faster lm_loss calculation
+# 自定义 language_model.forward：在训练中只计算必要 token 的 lm loss，加速大词表场景。
 def model_forward(self):
     def forward(
         input_ids: torch.LongTensor = None,
@@ -1226,13 +1263,19 @@ def model_forward(self):
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        """Qwen2 兼容前向。
+
+        fast_loss_cal=True 时，仅在 labels 非 ignore_index 的位置计算 lm_head，
+        可显著减少大词表投影开销。
+        """
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # 先拿到 decoder 输出（隐藏状态、可选缓存与注意力）。
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1249,13 +1292,13 @@ def model_forward(self):
         hidden_states = outputs[0]
         loss, logits = None, None
 
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # 根据 fast_loss_cal 路径选择 logits 计算策略。
         if not fast_loss_cal: # Keep original loss logic
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])
             if labels is not None:
                 loss = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-        else: # since the qwen model has a vary large lm head, we only calculate the necessary part
+        else: # 仅计算监督 token 的 logits，减少 lm_head 开销。
             logits = None
             ignore_index = -100
             labels_padded = nn.functional.pad(labels, (0, 1), value=ignore_index)   # (B, L+1)
@@ -1279,7 +1322,7 @@ def model_forward(self):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        # fix xlora hook accumulation
+        # 生成路径下清理 X-LoRA hook，避免长时间推理变慢。
         if labels is None and fast_loss_cal is False: # only clean during generation
             cleanup_xlora_pre_hooks(self.model, verbose=False)
 

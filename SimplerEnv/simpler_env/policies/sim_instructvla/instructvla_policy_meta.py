@@ -1,6 +1,10 @@
-"""
-instructvla_policy_meta.py
+"""SimplerEnv 中 InstructVLA 的 policy 对接实现（meta 版本）。
 
+本文件是 SimplerEnv 与 InstructVLA 模型之间的关键桥接层，核心职责：
+1) 加载 InstructVLA checkpoint
+2) 将环境观测图像转换成模型输入
+3) 调用 predict_action 获取原始动作
+4) 把原始动作转换成环境执行格式（平移/旋转/夹爪）
 """
 from collections import deque
 from typing import Optional, Sequence
@@ -32,18 +36,18 @@ def crop_and_resize(image, crop_scale, batch_size):
         crop_scale: The area of the center crop with respect to the original image.
         batch_size: Batch size.
     """
-    # Convert from 3D Tensor (H, W, C) to 4D Tensor (batch_size, H, W, C)
+    # 兼容单图与批量图输入，统一成 4D 张量。
     assert image.shape.ndims == 3 or image.shape.ndims == 4
     expanded_dims = False
     if image.shape.ndims == 3:
         image = tf.expand_dims(image, axis=0)
         expanded_dims = True
 
-    # Get height and width of crop
+    # 根据裁剪面积比例推导裁剪后的高宽比例。
     new_heights = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
     new_widths = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
 
-    # Get bounding box representing crop
+    # 构建中心裁剪框坐标。
     height_offsets = (1 - new_heights) / 2
     width_offsets = (1 - new_widths) / 2
     bounding_boxes = tf.stack(
@@ -56,10 +60,10 @@ def crop_and_resize(image, crop_scale, batch_size):
         axis=1,
     )
 
-    # Crop and then resize back up
+    # 执行中心裁剪并缩放回固定分辨率。
     image = tf.image.crop_and_resize(image, bounding_boxes, tf.range(batch_size), (224, 224))
 
-    # Convert back to 3D Tensor (H, W, C)
+    # 若原始输入是单图，则还原成 3D。
     if expanded_dims:
         image = image[0]
 
@@ -67,6 +71,8 @@ def crop_and_resize(image, crop_scale, batch_size):
 
 
 class InstructVLAInference:
+    """SimplerEnv 侧 InstructVLA 推理控制器。"""
+
     def __init__(
         self,
         saved_model_path: str = 'TBD',
@@ -83,8 +89,10 @@ class InstructVLAInference:
         action_ensemble = True,
         adaptive_ensemble_alpha = 0.1,
     ) -> None:
+        # 关闭 tokenizer 并行日志，减少控制台噪声。
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         if policy_setup == "widowx_bridge":
+            # widowx_bridge 默认使用 bridge 数据统计做动作反归一化。
             unnorm_key = "bridge_dataset" if unnorm_key is None else unnorm_key
             adaptive_ensemble_alpha = adaptive_ensemble_alpha
             if action_ensemble_horizon is None:
@@ -92,6 +100,7 @@ class InstructVLAInference:
                 action_ensemble_horizon = 7
             self.sticky_gripper_num_repeat = 1
         elif policy_setup == "google_robot":
+            # google_robot 默认使用 fractal 统计。
             unnorm_key = "fractal20220817_data" if unnorm_key is None else unnorm_key
             adaptive_ensemble_alpha = adaptive_ensemble_alpha
             if action_ensemble_horizon is None:
@@ -106,6 +115,7 @@ class InstructVLAInference:
         self.unnorm_key = unnorm_key
 
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+                # 加载 InstructVLA（推理模式）。
         self.vla = load_vla(
           saved_model_path,
           load_for_training=False, 
@@ -115,7 +125,9 @@ class InstructVLAInference:
         )
 
         if use_bf16:
+            # 推理常用 bf16 以降低显存占用。
             self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
+        # 切到 CUDA + eval，关闭训练行为。
         self.vla = self.vla.to("cuda").eval()
 
         self.image_size = image_size
@@ -133,6 +145,7 @@ class InstructVLAInference:
         self.image_history = deque(maxlen=self.horizon)
         self.cognition_features_history = deque(maxlen=self.horizon)
         if self.action_ensemble:
+            # 可选：动作历史集成，减小时间抖动。
             self.action_ensembler = AdaptiveEnsembler(self.action_ensemble_horizon, self.adaptive_ensemble_alpha)
         else:
             self.action_ensembler = None
@@ -142,10 +155,12 @@ class InstructVLAInference:
         self.cached_action = None
 
     def _add_cognition_features_to_history(self, cognition_feature) -> None:
+        """把当前认知特征写入历史缓存。"""
         self.cognition_features_history.append(cognition_feature)
         self.num_cognition_features_history = min(self.num_cognition_features_history + 1, self.horizon)
 
     def reset(self, task_description: str) -> None:
+        """任务切换时重置内部状态，避免跨任务污染。"""
         self.task_description = task_description
         self.image_history.clear()
         self.cognition_features_history.clear()
@@ -181,6 +196,7 @@ class InstructVLAInference:
         """
         if task_description is not None:
             if task_description != self.task_description:
+                # 指令变化则重置缓存。
                 self.reset(task_description)
 
         assert image.dtype == np.uint8
@@ -189,27 +205,30 @@ class InstructVLAInference:
             batch_size = 1
             crop_scale = 0.9
 
-            # Convert to TF Tensor and record original data type (should be tf.uint8)
+            # 先转 Tensor，再做裁剪缩放。
             image = tf.convert_to_tensor(image)
             orig_dtype = image.dtype
 
-            # Convert to data type tf.float32 and values between [0,1]
+            # 归一化到 [0,1] 便于几何变换。
             image = tf.image.convert_image_dtype(image, tf.float32)
 
-            # Crop and then resize back to original size
+            # 中心裁剪并缩放。
             image = crop_and_resize(image, crop_scale, batch_size)
 
-            # Convert back to original data type
+            # 转回原始 dtype。
             image = tf.clip_by_value(image, 0, 1)
             image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
 
-            # Convert back to PIL Image
+            # 转 PIL，匹配 vla.predict_action 输入格式。
             image: Image.Image = Image.fromarray(image.numpy())
             image = image.convert("RGB")
         else:
             image: Image.Image = Image.fromarray(image)
 
-        # if self.action_step == self.action_ensemble_horizon or self.cached_action is None:
+        # 调用模型主推理入口，得到:
+        # raw_actions: 反归一化动作
+        # normalized_actions: 归一化动作
+        # cognition_features_current: 当前语言-视觉隐变量
         raw_actions, normalized_actions, cognition_features_current = self.vla.predict_action(image=image, 
                                                                         instruction=self.task_description,
                                                                         unnorm_key=self.unnorm_key,
@@ -218,6 +237,7 @@ class InstructVLAInference:
             # self.cached_action = raw_actions
             # self.action_step = 0
         if self.action_ensemble:
+            # 对当前动作进行时间一致性融合。
             raw_actions = self.action_ensembler.ensemble_action(raw_actions)[None]
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),
@@ -225,17 +245,19 @@ class InstructVLAInference:
             "open_gripper": np.array(raw_actions[0, 6:7]),  # range [0, 1]; 1 = open; 0 = close
         }
 
-        # process raw_action to obtain the action to be sent to the maniskill2 environment
+        # 把模型输出动作映射到 SimplerEnv 控制格式。
         action = {}
         action["world_vector"] = raw_action["world_vector"] * self.action_scale
         action_rotation_delta = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
 
+        # 欧拉角增量 -> 轴角形式（环境侧使用轴角执行旋转）。
         roll, pitch, yaw = action_rotation_delta
         axes, angles = euler2axangle(roll, pitch, yaw)
         action_rotation_axangle = axes * angles
         action["rot_axangle"] = action_rotation_axangle * self.action_scale
 
         if self.policy_setup == "google_robot":
+            # google_robot 的夹爪逻辑采用 sticky 策略抑制高频开合抖动。
             action["gripper"] = 0
             current_gripper_action = raw_action["open_gripper"]
             if self.previous_gripper_action is None:
@@ -263,30 +285,34 @@ class InstructVLAInference:
             action["gripper"] = relative_gripper_action
 
         elif self.policy_setup == "widowx_bridge":
+            # bridge 环境使用 {-1, +1} 控制夹爪开合。
             action["gripper"] = 2.0 * (raw_action["open_gripper"] > 0.5) - 1.0
         
+        # SimplerEnv 里默认不由策略主动终止 episode。
         action["terminate_episode"] = np.array([0.0])
         return raw_action, action
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
+        """可视化辅助：缩放图像。"""
         image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)
         return image
 
     def visualize_epoch(
         self, predicted_raw_actions: Sequence[np.ndarray], images: Sequence[np.ndarray], save_path: str
     ) -> None:
+        """可视化一段轨迹中的动作曲线与关键帧。"""
         images = [self._resize_image(image) for image in images]
         ACTION_DIM_LABELS = ["x", "y", "z", "roll", "pitch", "yaw", "grasp"]
 
         img_strip = np.concatenate(np.array(images[::3]), axis=1)
 
-        # set up plt figure
+        # 构建“图像条 + 多维动作曲线”的拼图布局。
         figure_layout = [["image"] * len(ACTION_DIM_LABELS), ACTION_DIM_LABELS]
         plt.rcParams.update({"font.size": 12})
         fig, axs = plt.subplot_mosaic(figure_layout)
         fig.set_size_inches([45, 10])
 
-        # plot actions
+        # 绘制每一维动作随时间变化曲线。
         pred_actions = np.array(
             [
                 np.concatenate([a["world_vector"], a["rotation_delta"], a["open_gripper"]], axis=-1)

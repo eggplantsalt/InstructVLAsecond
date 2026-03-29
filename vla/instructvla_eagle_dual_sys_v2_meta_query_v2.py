@@ -1,6 +1,9 @@
-"""
-cogactvla.py
+"""InstructVLA 主模型实现（meta query v2）。
 
+该文件包含：
+1) InstructVLA 模型主体（语言 + 动作双分支）
+2) RLDS batch transform 与动作训练 collator
+3) 模型与数据加载入口（load / load_vla）
 """
 
 from __future__ import annotations
@@ -83,7 +86,14 @@ class InstructVLA(nn.Module):
         stage = "stage1",
         **kwargs,
     ) -> None:
+        """初始化 InstructVLA。
+
+        关键参数:
+        - stage: stage1=LoRA, stage2=X-LoRA
+        - meta_token_ids: 承载动作认知特征的 token 范围
+        """
         super().__init__()
+        # 动作分支：把认知 token + 视觉特征映射为未来动作序列。
         self.action_model = ActionModel(token_size,past_action_window_size,future_action_window_size,action_dim)
         
         self.vlm = vlm
@@ -108,6 +118,7 @@ class InstructVLA(nn.Module):
         self.trainable_module_keys = keys
 
         self.norm_stats = norm_stats
+        # 替换语言模型 forward 为加速版本（仅计算必要位置 loss）。
         self.vlm.language_model.forward = model_forward(self.vlm.language_model)
         self.vlm.language_model.transformer_layer_cls = Qwen2DecoderLayer
         
@@ -118,7 +129,7 @@ class InstructVLA(nn.Module):
         self.min_meta_token = self.meta_token_ids[0]
         self.max_meta_token = self.meta_token_ids[-1]
 
-        # Freeze all parameters in the model
+        # 根据 stage 配置训练策略。
         if stage == "stage1":
             overwatch.info("Train the model in stage 1 with lora and learnable embeddings")
             for param in self.vlm.parameters():
@@ -146,6 +157,7 @@ class InstructVLA(nn.Module):
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.requires_grad = True
 
             def mask_old_token_grad(grad: torch.Tensor):
+                # 仅更新新增 meta token 对应的梯度，旧词表梯度清零。
                 mask = torch.ones(grad.shape[0], dtype=torch.bool, device=grad.device)
                 mask[new_token_ids] = False 
                 grad[mask] = 0
@@ -195,6 +207,7 @@ class InstructVLA(nn.Module):
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.requires_grad = True
 
             def mask_old_token_grad(grad: torch.Tensor):
+                # stage2 同样限制旧词表梯度，降低语言能力退化风险。
                 mask = torch.ones(grad.shape[0], dtype=torch.bool, device=grad.device)
                 mask[new_token_ids] = False 
                 grad[mask] = 0
@@ -244,10 +257,12 @@ class InstructVLA(nn.Module):
     
     @property
     def fix_system1(self):
+        """是否冻结动作分支参数。"""
         return self._fix_system1
 
     @fix_system1.setter
     def fix_system1(self, value: bool):
+        """动态切换动作分支参数的 requires_grad。"""
         overwatch.warning(f"fix_system1 is being updated to: {value}")
         if value:
             for name, param in self.action_model.named_parameters():
@@ -260,18 +275,22 @@ class InstructVLA(nn.Module):
 
     @property
     def llm_backbone(self):
+        """返回语言骨干，供 FSDP 包装策略读取。"""
         return self.vlm.language_model
     
     @property
     def vision_backbone(self):
+        """返回视觉骨干，供 FSDP 包装策略读取。"""
         return self.vlm.vision_model
     
     def freeze_backbones(self, stage):
+        """透传到底层 VLM 的冻结逻辑。"""
         self.vlm.freeze_backbones(stage)
     
     @torch.inference_mode()
     def chat(self, *args, **kwargs):
-        # chat method from eagle vlm
+        """聊天接口：用于语言能力验证，不参与动作训练。"""
+        # chat 方法复用 Eagle VLM 原生生成接口。
         autocast_dtype = torch.bfloat16
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             ret = self.vlm.chat(*args, **kwargs)
@@ -299,9 +318,13 @@ class InstructVLA(nn.Module):
         train_idx = 0,
         **kwargs,
     ) -> Tuple:
+        """训练前向。
+
+        - actions is None: 仅计算语言损失
+        - actions is not None: 计算语言损失 + 动作损失
+        """
         if actions is None:
-            # standard vlm forward
-            # from IPython import embed;embed()
+            # 纯语言路径。
             per_device_batch_size = input_ids.shape[0]
             output: CausalLMOutputWithPast = self.vlm(
                 input_ids=input_ids,
@@ -322,6 +345,7 @@ class InstructVLA(nn.Module):
 
             assert per_device_batch_size == actions.shape[0]
 
+            # 先跑语言模型，提取最后层隐藏状态。
             output: CausalLMOutputWithPast = self.vlm(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -337,23 +361,25 @@ class InstructVLA(nn.Module):
                 fast_loss_cal=True
             )
 
-            # extract the last hidden state
+            # 提取最后一层 hidden states。
             last_hidden_states = output.hidden_states[-1]
             
-            # extract the latent action
+            # 通过 meta token 区间提取动作认知特征。
             meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
             meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
 
-            # actions_history = actions[:,0:self.past_action_window_size,:]
+            # 只监督未来动作窗口（含当前步）。
             actions_future = actions[:, -(self.future_action_window_size+1):, :]
             _, _, action_dim = actions_future.shape
             
+            # 动作分支输出 flow-matching loss。
             loss = self.action_model( latent_action = meta_feature,
                         pixel_values = dict(dino = system1_pixel_values),
                         actions = actions_future,
                         t = t,
                     )
 
+            # 总损失 = 动作损失 + 语言损失。
             return loss + output.loss, output.loss
 
     def get_fsdp_wrapping_policy(self) -> Callable:
@@ -399,12 +425,13 @@ class InstructVLA(nn.Module):
         num_of_meta_query = 64,
         **kwargs,
     ) -> InstructVLA:
+        """从 checkpoint 构建 InstructVLA（含 tokenizer 扩展与权重恢复）。"""
 
         llm_backbone_id = os.path.abspath(
                 os.path.join(os.path.dirname(__file__), "..", "ckpt", "Eagle2-2B")
             )
 
-        # Load VLM backbone, borrowed from PrismaticVLM
+        # 加载基础 VLM 骨干。
         vlm = AutoModel.from_pretrained(llm_backbone_id,
                                         attn_implementation="flash_attention_2",
                                         trust_remote_code=True)
@@ -422,19 +449,20 @@ class InstructVLA(nn.Module):
                                                   use_fast=True,
                                                   trust_remote_code=True)
 
-        new_tokens = ['<new_token_{}>'.format(i) for i in range(num_of_meta_query)]  # Create 256 new token names
+        # 注入 meta token，用于在文本序列中承载动作认知特征。
+        new_tokens = ['<new_token_{}>'.format(i) for i in range(num_of_meta_query)]
         overwatch.info(f"add {len(new_tokens)} latent action tokens")
         tokenizer.add_tokens(new_tokens)  # Add them to the tokenizer
         tokenizer.new_tokens = new_tokens
         processor.tokenizer = tokenizer
 
-        # Resize the model's token embeddings to match the new vocabulary size
+        # 扩展 embedding 尺寸以匹配新词表。
         try:  # Skip mean resize feature in new version of transformers
             vlm.language_model.resize_token_embeddings(len(tokenizer), mean_resizing = False)
         except Exception as e:
             vlm.language_model.resize_token_embeddings(len(tokenizer))
 
-        # Freeze all parameters in the model
+        # 先冻结参数，后续由 stage 策略控制可训练子模块。
         for param in vlm.parameters():
             param.requires_grad = False
 
@@ -477,7 +505,7 @@ class InstructVLA(nn.Module):
             instruct_vla.vlm.language_model.load_state_dict(model_state_dict["language_model"])
         
 
-        # Load ActionModel from Checkpoint
+        # 尝试恢复动作分支权重。
         if "action_model" in model_state_dict:
             instruct_vla.action_model.load_state_dict(model_state_dict["action_model"], strict=False)
         else:
@@ -493,24 +521,65 @@ class InstructVLA(nn.Module):
         use_generate = False,
         cache_latent = False,
         **kwargs: str
-    ) -> np.ndarray:
-        """
-        Core function for VLA inference; maps input image and task instruction to continuous action.
+    ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
+        """执行单次 VLA 动作推理。
 
-        @param image: PIL Image as [height, width, 3]
-        @param instruction: Task instruction string
-        @param unnorm_key: Optional dataset name for retrieving un-normalizing statistics; if None, checks that model
-                           was trained only on a single dataset, and retrieves those statistics.
+        语法:
+            actions, normalized_actions, meta_feature = self.predict_action(
+                image=image,
+                instruction=instruction,
+                unnorm_key=unnorm_key,
+                use_generate=False,
+                cache_latent=False,
+            )
 
-        @return Unnormalized (continuous) action vector --> end-effector deltas.
+        参数:
+            image (PIL.Image.Image): 输入图像，RGB，语义上等价于 ``[H, W, 3]``。
+            instruction (str): 自然语言任务指令，例如 "pick up the red block"。
+            unnorm_key (Optional[str]): 反归一化动作统计的键。
+                - 为 ``None`` 时，会在 ``self.get_action_stats`` 内按配置自动推断/校验。
+            use_generate (bool): 仅在 ``stage2`` 有效。
+                - ``True``: 先做一轮语言生成（reasoning），再拼接 meta tokens 做动作预测。
+                - ``False``: 直接进入动作 token 路径。
+            cache_latent (bool): 是否复用上一轮隐变量。
+                - ``False``: 每步都重新前向提取 hidden states。
+                - ``True``: 偶数步或缓存为空时刷新，否则复用 ``self.latent``。
+            **kwargs: 预留扩展参数（当前函数体未使用）。
+
+        返回:
+            Tuple[np.ndarray, np.ndarray, torch.Tensor]
+            1) actions:
+                - 反归一化后的连续动作，形状约为 ``[T, action_dim]``。
+                - 其中夹爪维（索引 6）会被离散为 {0,1} 后再映射到数据统计范围。
+            2) normalized_actions:
+                - 归一化动作，范围裁剪到 ``[-1, 1]``，形状约为 ``[T, action_dim]``。
+            3) meta_feature:
+                - 由 meta token 抽取得到的认知特征，形状约为 ``[B, N_meta, hidden_dim]``。
+
+        功能流程（高层）:
+            A. 构造 prompt（可选 stage2 reasoning）
+            B. 预处理文本/图像，得到 input_ids 与 pixel_values
+            C. 前向 VLM，提取最后层 hidden states（可选缓存）
+            D. 抽取 meta token 对应隐变量作为动作条件
+            E. ActionModel.sampling 生成归一化动作
+            F. 依据数据集统计量做动作反归一化
+            G. 维护推理状态并清理 X-LoRA pre-hooks
+
+        注意:
+            - 本函数由 ``@torch.inference_mode()`` 修饰，不记录梯度。
+            - 依赖 ``self.norm_stats`` 与 ``unnorm_key`` 的一致性。
+            - 返回是三元组，不是单一数组。
         """
-        # Build VLA Prompt
+        # 统一使用 BF16 autocast 以兼顾吞吐与显存占用。
     
         autocast_dtype = torch.bfloat16
+        # 在 stage2/use_generate 路径中可能提前由 prepare_input 直接给出像素张量。
         pixel_values = None
 
-        # Prepare Inputs
+        # stage2 可选先做一轮语言 reasoning，再补全动作 token。
+        # 该路径的目标是把短文本推理结果作为动作预测的语言条件之一。
         if use_generate and self.stage=="stage2":
+            # 每 20 步（或首次）刷新一次 reasoning，减少重复生成开销。
             if self.last_response is None or self.run_index % 20 == 0:
                 prompt = [
                     {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
@@ -524,6 +593,7 @@ class InstructVLA(nn.Module):
                         "content": ""
                     }
                 ]
+                # prepare_input: 推理态输入打包，不构建 labels。
                 inputs = self.processor.prepare_input({"prompt": prompt})
                 input_ids = inputs['input_ids'].to(self.vlm.device)
                 pixel_values = inputs['pixel_values']
@@ -531,6 +601,7 @@ class InstructVLA(nn.Module):
                 pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
                 
                 with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
+                    # 注意：这里使用 -10 作为占位 padding 的屏蔽条件（与本项目 tokenizer 流程一致）。
                     attention_mask = input_ids.ne(-10)
                     output: CausalLMOutputWithPast = self.vlm.generate(
                         input_ids=input_ids,
@@ -540,14 +611,16 @@ class InstructVLA(nn.Module):
                         # fast_loss_cal=False,
                         output_hidden_states=False,
                         return_dict_in_generate=False,
-                        stopping_criteria=self.stopping_criteria # to accelerate primitive
+                        # 命中停止词后提前结束，避免无效长输出。
+                        stopping_criteria=self.stopping_criteria
                     )
 
-                # Extract cognition feature
+                # 记录 reasoning 文本，供后续 prompt 复用。
                 response = self.tokenizer.decode(output[0]).replace("<new_token_0>","")
                 print("====== Reasoning ======= >" + response)
                 self.last_response = response
             else:
+                # 复用最近一次 reasoning，减少生成成本。
                 response = self.last_response
 
             prompt = [
@@ -563,6 +636,7 @@ class InstructVLA(nn.Module):
                 }
             ]
         else:
+            # 非 reasoning 路径：直接使用“指令 + meta token”模板做动作条件构建。
             prompt = [
                 {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                 {
@@ -575,14 +649,18 @@ class InstructVLA(nn.Module):
                     "content": "".join(self.processor.tokenizer.new_tokens)
                 }
             ]
+
+        # 训练态同款预处理：构建 input_ids 与 pixel_values（同时可得到 labels，但此处不使用 labels）。
         inputs = self.processor.preprocess_inputs_and_labels({"prompt": prompt})
+        # 扩展 batch 维度 -> [1, L]
         input_ids = inputs['input_ids'].to(self.vlm.device).unsqueeze(0)
         if pixel_values is None:
-            # Preprocess Image
+            # 若未在 reasoning 分支中提前准备像素张量，这里从 preprocess 结果读取。
             pixel_values = inputs['pixel_values']
             pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
 
-        # Generate cognition feature through vlm
+        # 通过 VLM 前向提取认知特征（可选缓存 latent）。
+        # 复用条件: cache_latent=True 且当前为奇数步且已有缓存。
         if cache_latent is False or (cache_latent is True and (self.run_index % 2 == 0 or self.latent is None)):
             with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
                 attention_mask = input_ids.ne(-10)
@@ -597,41 +675,58 @@ class InstructVLA(nn.Module):
                     output_hidden_states=True,
                 )
 
-            # Extract cognition feature
+            # 保存最后一层 hidden states，供当前/后续步抽取 meta token 表示。
             last_hidden_states = output.hidden_states[-1]
             self.latent = last_hidden_states.detach()
         else:
+            # 命中复用策略时直接使用缓存，跳过 VLM 前向。
             last_hidden_states = self.latent
             
+        # 取出 meta token 对应隐变量。
+        # meta_feature_mask: [B, L] 的 bool 掩码；True 位置对应新增 meta token。
         meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
         meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
 
+        # 仅用于调试形状，当前函数未显式使用。
         BS, step, dim = meta_feature.shape
 
+        # system1 动作分支使用 DINO 预处理；保持与动作头训练输入一致。
         sys1_pixel_values = dict(dino = self.action_model.default_dino_transform(image).unsqueeze(0).to(self.vlm.device))
+        # 动作分支采样得到归一化动作。
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             samples = self.action_model.sampling(   latent_action = meta_feature,
                                                     pixel_values = sys1_pixel_values,
                                                     )
+        # samples[0]: 去掉 batch 维度，转为 numpy 便于后续后处理。
         normalized_actions = samples[0].float().cpu().numpy()
 
-        # Un-normalize Actions        
+        # 按数据集统计量反归一化，得到可执行动作范围。
         action_norm_stats = self.get_action_stats(unnorm_key)
+        # mask=False 的维度保持归一化值；mask=True 的维度执行线性反归一化。
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        # 归一化动作裁剪到 [-1, 1]，避免异常值放大。
         normalized_actions = np.clip(normalized_actions, -1, 1)
+        # 夹爪维（索引 6）做二值化，强化开合决策稳定性。
         normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
+
+        # 推理步计数器更新，影响 reasoning 刷新与 latent 复用策略。
         self.run_index += 1
+
+        # 清理 X-LoRA 累积 hook，避免长时推理退化。
         cleanup_xlora_pre_hooks(self.vlm.language_model)
+
+        # 返回三元组：反归一化动作、归一化动作、认知特征。
         return actions, normalized_actions, meta_feature
 
     @staticmethod
     def _check_unnorm_key(norm_stats, unnorm_key):
+        """校验 unnorm_key 是否存在于 norm_stats。"""
         if unnorm_key is None:
             assert len(norm_stats) == 1, (
                 f"Your model was trained on more than one dataset, "
@@ -647,12 +742,12 @@ class InstructVLA(nn.Module):
         return unnorm_key
 
     def get_action_dim(self, unnorm_key=None):
-        """Dimensionality of the policy's action space."""
+        """返回动作空间维度。"""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return len(self.norm_stats[unnorm_key]["action"]["q01"])
 
     def get_action_stats(self, unnorm_key=None):
-        """Dimensionality of the policy's action space."""
+        """返回动作反归一化统计量。"""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
 
