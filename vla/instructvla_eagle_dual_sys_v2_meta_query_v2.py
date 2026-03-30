@@ -93,7 +93,7 @@ class InstructVLA(nn.Module):
         - meta_token_ids: 承载动作认知特征的 token 范围
         """
         super().__init__()
-        # 动作分支：把认知 token + 视觉特征映射为未来动作序列。
+        # action axpert：把latent token + 视觉特征映射为未来动作序列。
         self.action_model = ActionModel(token_size,past_action_window_size,future_action_window_size,action_dim)
         
         self.vlm = vlm
@@ -135,6 +135,8 @@ class InstructVLA(nn.Module):
             for param in self.vlm.parameters():
                 param.requires_grad = False
 
+
+            #后面通常会配合 get_peft_model(self.vlm.language_model, lora_config) 使用
             lora_config = LoraConfig(
                     r=128,
                     lora_alpha=256,
@@ -156,6 +158,8 @@ class InstructVLA(nn.Module):
             self.vlm.language_model.base_model.model.lm_head.weight.requires_grad = True
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.requires_grad = True
 
+
+            #通过掩码的方式，只更新新加入的learnable tokens对应的梯度
             def mask_old_token_grad(grad: torch.Tensor):
                 # 仅更新新增 meta token 对应的梯度，旧词表梯度清零。
                 mask = torch.ones(grad.shape[0], dtype=torch.bool, device=grad.device)
@@ -364,9 +368,17 @@ class InstructVLA(nn.Module):
             # 提取最后一层 hidden states。
             last_hidden_states = output.hidden_states[-1]
             
-            # 通过 meta token 区间提取动作认知特征。
+
+
+            """ 通过 meta token 区间提取动作认知特征。"""
+            #input_ids是 [B, S]， last_hidden_states是 [B, S, D]， 通过meta token的mask选出对应的hidden state，得到 [B, N_meta, D]
             meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
+            # meta_feature_mask.size(0)：保持原始的 Batch Size（批大小）。
+            # -1：这是一个自动计算占位符。PyTorch 会根据总元素量自动推算出每条数据中有多少个 Meta Token。
+            # last_hidden_states.shape[-1]：保持原始的 Hidden Size（向量维度，如 768 或 1024）
             meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
+
+
 
             # 只监督未来动作窗口（含当前步）。
             actions_future = actions[:, -(self.future_action_window_size+1):, :]
@@ -520,6 +532,7 @@ class InstructVLA(nn.Module):
         unnorm_key: Optional[str] = None, 
         use_generate = False,
         cache_latent = False,
+        prompt_mode = "image_text_primary",# "image_text_primary"or "default"
         **kwargs: str
     ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
         """执行单次 VLA 动作推理。
@@ -572,9 +585,38 @@ class InstructVLA(nn.Module):
         """
         # 统一使用 BF16 autocast 以兼顾吞吐与显存占用。
     
+
+
+
+
+        if prompt_mode == "default":
+            user_prompt = f"What action should the robot take to {instruction}?"
+            user_prompt_reason = f"What action should the robot take to {instruction}? First answer my question."
+        elif prompt_mode == "image_text_primary":
+            user_prompt = (
+                "Use the command written in the image as the primary instruction. "
+                "Read the text in the image, ground it to the scene, and execute it."
+            )
+            user_prompt_reason = (
+                "Use the command written in the image as the primary instruction. "
+                "Read the text in the image, briefly explain what the robot should do, "
+                "then execute it."
+            )
+        else:
+            raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
+        
+
+
+
+
+
         autocast_dtype = torch.bfloat16
         # 在 stage2/use_generate 路径中可能提前由 prepare_input 直接给出像素张量。
         pixel_values = None
+
+
+
+
 
         # stage2 可选先做一轮语言 reasoning，再补全动作 token。
         # 该路径的目标是把短文本推理结果作为动作预测的语言条件之一。
@@ -585,7 +627,8 @@ class InstructVLA(nn.Module):
                     {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                     {
                         "role": "user",
-                        "content": f"What action should the robot take to {instruction}? First answer my question.",
+                        # "content": f"What action should the robot take to {instruction}? First answer my question.",
+                        "content": user_prompt_reason,
                         "image": [{'np_array': np.asarray(image)}],
                     },
                     {
@@ -627,7 +670,8 @@ class InstructVLA(nn.Module):
                 {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                 {
                     "role": "user",
-                    "content": f"What action should the robot take to {instruction}? First answer my question.",
+                    # "content": f"What action should the robot take to {instruction}? First answer my question.",
+                    "content": user_prompt_reason,
                     "image": [{'np_array': np.asarray(image)}],
                 },
                 {
@@ -641,7 +685,8 @@ class InstructVLA(nn.Module):
                 {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                 {
                     "role": "user",
-                    "content": f"What action should the robot take to {instruction}?",
+                    # "content": f"What action should the robot take to {instruction}?",
+                    "content": user_prompt,
                     "image": [{'np_array': np.asarray(image)}],
                 },
                 {
@@ -677,13 +722,13 @@ class InstructVLA(nn.Module):
 
             # 保存最后一层 hidden states，供当前/后续步抽取 meta token 表示。
             last_hidden_states = output.hidden_states[-1]
+            #.detach() 断开计算图，避免梯度回传；赋值给 self.latent 以供后续复用。
             self.latent = last_hidden_states.detach()
         else:
             # 命中复用策略时直接使用缓存，跳过 VLM 前向。
             last_hidden_states = self.latent
             
         # 取出 meta token 对应隐变量。
-        # meta_feature_mask: [B, L] 的 bool 掩码；True 位置对应新增 meta token。
         meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
         meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
 

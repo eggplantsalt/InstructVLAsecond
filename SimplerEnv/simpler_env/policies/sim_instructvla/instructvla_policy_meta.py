@@ -9,7 +9,67 @@
 from collections import deque
 from typing import Optional, Sequence
 import os
-from PIL import Image
+# from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+
+#新加的函数
+def render_text_on_image(
+    image: Image.Image,
+    text: str,
+    font_size: int = 18,
+    margin: int = 8,
+    max_chars_per_line: int = 48,
+) -> Image.Image:
+    img = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        test = w if cur == "" else cur + " " + w
+        if len(test) <= max_chars_per_line:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+
+    if len(lines) == 0:
+        return img
+
+    line_heights = []
+    line_widths = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_widths.append(bbox[2] - bbox[0])
+        line_heights.append(bbox[3] - bbox[1])
+
+    text_block_h = sum(line_heights) + margin * (len(lines) + 1)
+    text_block_w = min(max(line_widths) + 2 * margin, img.width)
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle(
+        [(0, 0), (text_block_w, text_block_h)],
+        fill=(0, 0, 0, 180)
+    )
+
+    y = margin
+    for i, line in enumerate(lines):
+        overlay_draw.text((margin, y), line, font=font, fill=(255, 255, 255, 255))
+        y += line_heights[i] + margin
+
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    return img
+
 import torch
 import cv2 as cv
 import matplotlib.pyplot as plt
@@ -160,23 +220,41 @@ class InstructVLAInference:
         self.num_cognition_features_history = min(self.num_cognition_features_history + 1, self.horizon)
 
     def reset(self, task_description: str) -> None:
-        """任务切换时重置内部状态，避免跨任务污染。"""
+        """任务切换时重置内部状态，避免跨任务污染。
+
+        这个函数会把与上一条任务相关的缓存、计数器、夹爪粘滞状态、
+        以及 VLA 推理上下文全部清空，让下一次 `step` 从干净状态开始。
+        """
+        # 更新当前任务文本；后续 `step` 会用这个描述作为语言条件输入。
         self.task_description = task_description
+        # 清空图像历史队列（长度受 horizon 限制），避免上一任务视觉上下文残留。
         self.image_history.clear()
+        # 清空认知特征历史，防止旧任务的隐状态影响新任务动作。
         self.cognition_features_history.clear()
+        # 如果启用了动作集成器，同时重置其内部时间窗口缓存。
         if self.action_ensemble:
             self.action_ensembler.reset()
+        # 历史有效帧计数归零；后续会在 step 中重新累计。
         self.num_image_history = 0
+        # 认知特征有效帧计数归零。
         self.num_cognition_features_history = 0
-
+        # 关闭 sticky gripper 状态机，表示当前不处于“持续重复夹爪动作”阶段。
         self.sticky_action_is_on = False
+        # sticky 重复计数器清零。
         self.gripper_action_repeat = 0
+        # sticky 夹爪动作值复位为 0。
         self.sticky_gripper_action = 0.0
+        # 上一时刻夹爪动作置空；下一次会按“首次观测”逻辑处理。
         self.previous_gripper_action = None
+        # 清理 VLA 侧上一轮文本响应缓存。
         self.vla.last_response = None
+        # 重置 VLA 内部运行步号（通常用于多步推理/追踪）。
         self.vla.run_index = 0
+        # 清理 VLA 潜变量缓存，避免跨任务复用旧 latent。
         self.vla.latent = None
+        # 本策略动作步号归零。
         self.action_step = 0
+        # 已缓存动作清空；下一步必须重新调用模型预测。
         self.cached_action = None
 
     def step(
@@ -224,6 +302,17 @@ class InstructVLAInference:
             image = image.convert("RGB")
         else:
             image: Image.Image = Image.fromarray(image)
+            image = image.convert("RGB")
+
+        render_instruction_on_image = True
+        image_text = self.task_description if self.task_description is not None else ""
+
+        if render_instruction_on_image and image_text:
+            image = render_text_on_image(image, image_text)
+            if not hasattr(self, "_debug_saved_image"):
+                image.save("debug_instruction_overlay.jpg")
+                self._debug_saved_image = True
+                print(f"[DEBUG] saved overlay image with text: {image_text}")
 
         # 调用模型主推理入口，得到:
         # raw_actions: 反归一化动作
@@ -233,6 +322,7 @@ class InstructVLAInference:
                                                                         instruction=self.task_description,
                                                                         unnorm_key=self.unnorm_key,
                                                                         do_sample=False, 
+                                                                        prompt_mode="image_text_primary",
                                                                         )
             # self.cached_action = raw_actions
             # self.action_step = 0
