@@ -265,7 +265,7 @@ class InstructVLA(nn.Module):
     @torch.inference_mode()
     def chat(self, *args, **kwargs):
         # chat method from eagle vlm
-        autocast_dtype = torch.bfloat16
+        autocast_dtype = torch.float16
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             ret = self.vlm.chat(*args, **kwargs)
         return ret
@@ -370,7 +370,7 @@ class InstructVLA(nn.Module):
 
         # Load VLM backbone, borrowed from PrismaticVLM
         vlm = AutoModel.from_pretrained(llm_backbone_id,
-                                        attn_implementation="flash_attention_2",
+                                        attn_implementation="sdpa",
                                         trust_remote_code=True)
 
         processor = EagleProcessor(
@@ -472,7 +472,7 @@ class InstructVLA(nn.Module):
         """
         # Build VLA Prompt
     
-        autocast_dtype = torch.bfloat16
+        autocast_dtype = torch.float16
         pixel_values = None
 
         # Prepare Inputs
@@ -659,7 +659,7 @@ def load(
 
     vlm = AutoModel.from_pretrained(
         llm_backbone_id,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         trust_remote_code=True
         )
 

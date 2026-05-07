@@ -145,7 +145,7 @@ class InstructVLAInference:
         action_dim: int = 7,
         action_model_type: str = "DiT-B",
         action_scale: float = 1.0,
-        use_bf16: bool = True,
+        use_bf16: bool = False,
         action_ensemble = True,
         adaptive_ensemble_alpha = 0.1,
     ) -> None:
@@ -185,8 +185,9 @@ class InstructVLAInference:
         )
 
         if use_bf16:
-            # 推理常用 bf16 以降低显存占用。
             self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
+        else:
+            self.vla.vlm = self.vla.vlm.to(torch.float16)
         # 切到 CUDA + eval，关闭训练行为。
         self.vla = self.vla.to("cuda").eval()
 

@@ -404,7 +404,7 @@ class InstructVLA(nn.Module):
 
         # Load VLM backbone, borrowed from PrismaticVLM
         vlm = AutoModel.from_pretrained(llm_backbone_id,
-                                        attn_implementation="sdpa",
+                                        attn_implementation="flash_attention_2",
                                         trust_remote_code=True)
 
         processor = EagleProcessor(
@@ -1076,7 +1076,7 @@ def load(
 
     vlm = AutoModel.from_pretrained(
         llm_backbone_id,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         trust_remote_code=True
         )
 

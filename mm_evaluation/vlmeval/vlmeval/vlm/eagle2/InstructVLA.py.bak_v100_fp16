@@ -29,19 +29,6 @@ from .utils import (build_multi_choice_prompt,
 # Not in this dir
 from .modeling_instructvla import load, load_vla
 
-# V100-compatible manual generation path.
-# This bypasses model.vlm.generate(), which fails on V100/non-flash-attn backends
-# with Qwen2 attention-mask length mismatch.
-import sys
-from pathlib import Path as _V100Path
-
-_V100_ROOT = _V100Path(__file__).resolve().parents[5]
-if str(_V100_ROOT) not in sys.path:
-    sys.path.insert(0, str(_V100_ROOT))
-
-from scripts_vpi.instructvla_v100_utils import ask_image, patch_runtime_configs
-
-
 
 ''' python
 from PIL import Image
@@ -55,7 +42,7 @@ messages = [
     }
 ]
 inputs = self.model.processor.prepare_input(dict(prompt=messages))
-autocast_dtype = torch.float16
+autocast_dtype = torch.bfloat16
 with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
     output = self.model.vlm.generate(
         input_ids=inputs['input_ids'].cuda(),
@@ -82,8 +69,7 @@ class InstructVLA(BaseModel):
 
         device = torch.cuda.current_device()
         self.device = device
-        self.model = load_vla(model_path).eval().to(torch.float16)
-        patch_runtime_configs(self.model)
+        self.model = load_vla(model_path).eval().to(torch.bfloat16)
         assert self.model.stage == "stage2", 'The stage-1 model dose not have QA ability'
         self.tokenizer = self.model.tokenizer
 
@@ -213,7 +199,7 @@ class InstructVLA(BaseModel):
                 if dataset is not None and listinstr(['MathVista_MINI', 'AI2D_TEST', 'InfoVQA_VAL', 'InfoVQA_TEST', 'Video-MME'], dataset):
                     upscale_flag = False
                 curr_pixel_values = load_image(
-                    file_name, max_num=self.max_num, upscale=upscale_flag, norm_type=self.norm_type).cuda().to(torch.float16)
+                    file_name, max_num=self.max_num, upscale=upscale_flag, norm_type=self.norm_type).cuda().to(torch.bfloat16)
                 num_patches_list.append(curr_pixel_values.size(0))
                 pixel_values_list.append(curr_pixel_values)
             pixel_values = torch.cat(pixel_values_list, dim=0)
@@ -223,31 +209,23 @@ class InstructVLA(BaseModel):
             if dataset is not None and listinstr(['MathVista_MINI', 'AI2D_TEST', 'InfoVQA_VAL', 'InfoVQA_TEST', 'Video-MME'], dataset):
                  upscale_flag = False
             pixel_values = load_image(
-                image_path, max_num=self.max_num, upscale=upscale_flag, norm_type=self.norm_type).cuda().to(torch.float16)
+                image_path, max_num=self.max_num, upscale=upscale_flag, norm_type=self.norm_type).cuda().to(torch.bfloat16)
             num_patches_list = [pixel_values.size(0)]
         else:
             pixel_values = None
             num_patches_list = []
         if 'Answer the question using a single word or phrase.' in prompt or "Answer with the option's letter from the given choices directly."  in prompt:
             self.kwargs['max_new_tokens'] = 128
-        # V100 manual generation path:
-        # The original self.model.chat(...) eventually calls model.vlm.generate(...),
-        # which fails on V100/non-flash-attn backends due to Qwen2 attention-mask mismatch.
-        image_paths = [x['value'] for x in message if x['type'] == 'image']
-        if len(image_paths) != 1:
-            raise NotImplementedError(
-                f"V100 manual VLMEval wrapper currently supports single-image samples only, got {len(image_paths)} images."
+        with torch.no_grad():
+            response = self.model.chat(
+                self.tokenizer,
+                pixel_values=pixel_values,
+                num_patches_list=num_patches_list,
+                question=prompt,
+                generation_config=self.kwargs,
+                verbose=True
             )
 
-        result = ask_image(
-            model=self.model,
-            image_path=image_paths[0],
-            question=prompt,
-            dtype=torch.float16,
-            max_new_tokens=int(self.kwargs.get("max_new_tokens", 128)),
-            verbose=False,
-        )
-        response = result["response"].replace("<new_token_0>", "")
         return response
 
     def generate_inner(self, message, dataset=None):
@@ -317,14 +295,14 @@ class InstructVLA(BaseModel):
             for image_idx, file_name in enumerate(image_path):
                 upscale_flag = image_idx == 0 and dataset is not None and listinstr(['MMMU_DEV_VAL'], dataset)
                 curr_pixel_values = load_image(
-                    file_name, max_num=self.max_num, upscale=upscale_flag).to(self.device).to(torch.float16)
+                    file_name, max_num=self.max_num, upscale=upscale_flag).to(self.device).to(torch.bfloat16)
                 num_patches_list.append(curr_pixel_values.size(0))
                 pixel_values_list.append(curr_pixel_values)
             pixel_values = torch.cat(pixel_values_list, dim=0)
         elif image_cnt == 1:
             upscale_flag = listinstr(['MMMU_DEV_VAL'], dataset)
             pixel_values = load_image(
-                image_path, max_num=self.max_num, upscale=upscale_flag).to(self.device).to(torch.float16)
+                image_path, max_num=self.max_num, upscale=upscale_flag).to(self.device).to(torch.bfloat16)
             num_patches_list = [pixel_values.size(0)]
         else:
             pixel_values = None

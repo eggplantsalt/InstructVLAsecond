@@ -14,7 +14,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import numpy as np
-from PIL import Image
+# from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy, transformer_auto_wrap_policy
 from torch.nn.utils.rnn import pad_sequence
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -56,7 +57,7 @@ from types import SimpleNamespace
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 import numpy as np
-from PIL import Image
+
 
 def horizontal_concat(images: list[np.ndarray]) -> np.ndarray:
     heights = [img.shape[0] for img in images]
@@ -64,6 +65,68 @@ def horizontal_concat(images: list[np.ndarray]) -> np.ndarray:
         raise ValueError()
     result = np.concatenate(images, axis=1)
     return result
+
+
+
+def render_text_on_image(
+    image: Image.Image,
+    text: str,
+    font_size: int = 18,
+    margin: int = 8,
+    max_chars_per_line: int = 48,
+) -> Image.Image:
+    img = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        test = w if cur == "" else cur + " " + w
+        if len(test) <= max_chars_per_line:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+
+    if len(lines) == 0:
+        return img
+
+    line_heights = []
+    line_widths = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_widths.append(bbox[2] - bbox[0])
+        line_heights.append(bbox[3] - bbox[1])
+
+    text_block_h = sum(line_heights) + margin * (len(lines) + 1)
+    text_block_w = min(max(line_widths) + 2 * margin, img.width)
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle(
+        [(0, 0), (text_block_w, text_block_h)],
+        fill=(0, 0, 0, 180)
+    )
+
+    y = margin
+    for i, line in enumerate(lines):
+        overlay_draw.text((margin, y), line, font=font, fill=(255, 255, 255, 255))
+        y += line_heights[i] + margin
+
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    return img
+
+
+
 
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
@@ -80,11 +143,11 @@ from .action_head import ActionModel
 class InstructVLA(nn.Module):
     def __init__(
         self,
-        vlm: AutoModel,
+        vlm: AutoModel,from PIL import Image
         processor: AutoProcessor = None,
         tokenizer: AutoTokenizer = None,
         token_size: int = 4096,
-        action_dim: int = 7,
+        action_dim: int = 7,from PIL import Image
         future_action_window_size: int = 7,
         past_action_window_size: int = 1,
         norm_stats: Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]] = None,
@@ -279,7 +342,8 @@ class InstructVLA(nn.Module):
     @torch.inference_mode()
     def chat(self, *args, **kwargs):
         # chat method from eagle vlm
-        autocast_dtype = torch.bfloat16
+        # autocast_dtype = torch.bfloat16
+        autocast_dtype = torch.float16
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             ret = self.vlm.chat(*args, **kwargs)
         return ret
@@ -413,7 +477,7 @@ class InstructVLA(nn.Module):
 
         # Load VLM backbone, borrowed from PrismaticVLM
         vlm = AutoModel.from_pretrained(llm_backbone_id,
-                                        attn_implementation="flash_attention_2",
+                                        # attn_implementation="sdpa",
                                         trust_remote_code=True)
 
         processor = EagleProcessor(
@@ -513,7 +577,9 @@ class InstructVLA(nn.Module):
         """
         # Build VLA Prompt
     
-        autocast_dtype = torch.bfloat16
+        # autocast_dtype = torch.bfloat16
+        autocast_dtype = torch.float16
+
         pixel_values = None
 
         image, wrist_image = image
@@ -897,7 +963,7 @@ def load(
 
     vlm = AutoModel.from_pretrained(
         llm_backbone_id,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="sdpa",
         trust_remote_code=True
         )
 
