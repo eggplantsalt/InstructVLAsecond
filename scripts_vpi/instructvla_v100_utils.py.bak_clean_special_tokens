@@ -233,7 +233,7 @@ def manual_greedy_generate(
         )
         cur_attention_mask = torch.cat([cur_attention_mask, one_mask], dim=1)
 
-    decoded = tokenizer.decode(new_token_ids, skip_special_tokens=True)
+    decoded = tokenizer.decode(new_token_ids, skip_special_tokens=False)
     return new_token_ids, decoded
 
 

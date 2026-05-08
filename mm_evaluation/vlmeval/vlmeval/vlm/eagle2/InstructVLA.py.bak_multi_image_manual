@@ -39,7 +39,7 @@ _V100_ROOT = _V100Path(__file__).resolve().parents[5]
 if str(_V100_ROOT) not in sys.path:
     sys.path.insert(0, str(_V100_ROOT))
 
-from scripts_vpi.instructvla_v100_utils import ask_image, ask_images, patch_runtime_configs
+from scripts_vpi.instructvla_v100_utils import ask_image, patch_runtime_configs
 
 
 
@@ -233,26 +233,21 @@ class InstructVLA(BaseModel):
         # V100 manual generation path:
         # The original self.model.chat(...) eventually calls model.vlm.generate(...),
         # which fails on V100/non-flash-attn backends due to Qwen2 attention-mask mismatch.
-        # Here we support both single-image and multi-image samples through ask_images().
         image_paths = [x['value'] for x in message if x['type'] == 'image']
+        if len(image_paths) != 1:
+            raise NotImplementedError(
+                f"V100 manual VLMEval wrapper currently supports single-image samples only, got {len(image_paths)} images."
+            )
 
-        result = ask_images(
+        result = ask_image(
             model=self.model,
-            image_paths=image_paths,
+            image_path=image_paths[0],
             question=prompt,
             dtype=torch.float16,
             max_new_tokens=int(self.kwargs.get("max_new_tokens", 128)),
             verbose=False,
-            fallback_to_contact_sheet=True,
         )
-
-        response = (
-            result["response"]
-            .replace("<new_token_0>", "")
-            .replace("<|im_end|>", "")
-            .replace("<|endoftext|>", "")
-            .strip()
-        )
+        response = result["response"].replace("<new_token_0>", "")
         return response
 
     def generate_inner(self, message, dataset=None):

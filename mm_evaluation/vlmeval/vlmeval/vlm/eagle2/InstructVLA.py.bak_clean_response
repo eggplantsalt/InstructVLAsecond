@@ -246,13 +246,7 @@ class InstructVLA(BaseModel):
             fallback_to_contact_sheet=True,
         )
 
-        response = (
-            result["response"]
-            .replace("<new_token_0>", "")
-            .replace("<|im_end|>", "")
-            .replace("<|endoftext|>", "")
-            .strip()
-        )
+        response = result["response"].replace("<new_token_0>", "")
         return response
 
     def generate_inner(self, message, dataset=None):
