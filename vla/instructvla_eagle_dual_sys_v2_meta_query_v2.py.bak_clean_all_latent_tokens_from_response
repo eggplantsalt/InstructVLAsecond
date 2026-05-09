@@ -662,12 +662,7 @@ class InstructVLA(nn.Module):
                     )
 
                 # 记录 reasoning 文本，供后续 prompt 复用。
-                # Important: <new_token_*> are latent action query tokens, not textual reasoning.
-                # Keep them out of response; the action prompt appends tokenizer.new_tokens later.
-                import re
-                response = str(response)
-                response = re.sub(r"<new_token_\\d+>", "", response)
-                response = response.replace("<new_token_0>", "").strip()
+                response = str(response).replace("<new_token_0>", "").strip()
                 print("====== Reasoning ======= >" + response)
                 self.last_response = response
             else:

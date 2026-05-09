@@ -261,29 +261,15 @@ class ActionModel(nn.Module):
                 # make 4d mask
                 total_len = vis_len + cog_len + fut_len
 
-                # Blockwise attention pattern.
-                # `allowed=True` means this query-key pair can attend.
-                allowed = torch.zeros((total_len, total_len), dtype=torch.bool, device=input_seq.device)
-                allowed[:vis_len, :vis_len] = True
-                allowed[vis_len:vis_len+cog_len, :vis_len+cog_len] = True
-                allowed[vis_len+cog_len:, :total_len] = True
-
-                # Newer transformers / LLaMA expects a 4D custom attention mask
-                # to be a float additive mask, not a BoolTensor.
-                # allowed positions -> 0.0
-                # masked positions  -> dtype minimum value
-                min_dtype = torch.finfo(input_seq.dtype).min
-                attention_mask = torch.full(
-                    (total_len, total_len),
-                    fill_value=min_dtype,
-                    dtype=input_seq.dtype,
-                    device=input_seq.device,
-                )
-                attention_mask = attention_mask.masked_fill(allowed, 0.0)
+                # blockwise causal attention mask
+                attention_mask = torch.zeros((total_len, total_len), dtype=torch.bool, device=input_seq.device)
+                attention_mask[:vis_len, :vis_len] = 1
+                attention_mask[vis_len:vis_len+cog_len, :vis_len+cog_len] = 1
+                attention_mask[vis_len+cog_len:, :total_len] = 1
 
                 # expand to 4d mask
                 # [BS, 1, q_len, kv_len]
-                attention_mask = attention_mask.unsqueeze(0).unsqueeze(1)
+                attention_mask = attention_mask.unsqueeze(0).unsqueeze(1).expand(1, 1, total_len, total_len)
             
             encoded_seq = self.VideoGPT(
                 inputs_embeds=input_seq,

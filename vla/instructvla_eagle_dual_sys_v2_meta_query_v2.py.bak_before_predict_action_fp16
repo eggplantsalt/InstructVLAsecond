@@ -533,7 +533,7 @@ class InstructVLA(nn.Module):
         unnorm_key: Optional[str] = None, 
         use_generate = False,
         cache_latent = False,
-        prompt_mode = "default",  # "default", "visual_centric", or legacy "image_text_primary"
+        prompt_mode = "image_text_primary",# "image_text_primary"or "default"
         **kwargs: str
     ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
         """执行单次 VLA 动作推理。
@@ -593,14 +593,15 @@ class InstructVLA(nn.Module):
         if prompt_mode == "default":
             user_prompt = f"What action should the robot take to {instruction}?"
             user_prompt_reason = f"What action should the robot take to {instruction}? First answer my question."
-        elif prompt_mode in ("visual_centric", "image_text_primary"):
+        elif prompt_mode == "image_text_primary":
             user_prompt = (
-                "What action should the robot take to accomplish the task instruction written in the image? "
-                "Read the text in the image as the task instruction."
+                "Use the command written in the image as the primary instruction. "
+                "Read the text in the image, ground it to the scene, and execute it."
             )
             user_prompt_reason = (
-                "What action should the robot take to accomplish the task instruction written in the image? "
-                "First answer my question."
+                "Use the command written in the image as the primary instruction. "
+                "Read the text in the image, briefly explain what the robot should do, "
+                "then execute it."
             )
         else:
             raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
@@ -610,7 +611,7 @@ class InstructVLA(nn.Module):
 
 
 
-        autocast_dtype = torch.float16
+        autocast_dtype = torch.bfloat16
         # 在 stage2/use_generate 路径中可能提前由 prepare_input 直接给出像素张量。
         pixel_values = None
 
@@ -644,30 +645,22 @@ class InstructVLA(nn.Module):
                 pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
                 
                 with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
-                    # V100 path: bypass HuggingFace generate(inputs_embeds + attention_mask),
-                    # which can trigger attention-mask shape mismatch, e.g. 298 vs 596.
-                    from scripts_vpi.instructvla_v100_utils import manual_greedy_generate
-
                     # 注意：这里使用 -10 作为占位 padding 的屏蔽条件（与本项目 tokenizer 流程一致）。
                     attention_mask = input_ids.ne(-10)
-
-                    token_ids, response = manual_greedy_generate(
-                        vlm=self.vlm,
+                    output: CausalLMOutputWithPast = self.vlm.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         pixel_values=pixel_values,
-                        tokenizer=self.tokenizer,
                         max_new_tokens=50,
-                        verbose=False,
+                        # fast_loss_cal=False,
+                        output_hidden_states=False,
+                        return_dict_in_generate=False,
+                        # 命中停止词后提前结束，避免无效长输出。
+                        stopping_criteria=self.stopping_criteria
                     )
 
                 # 记录 reasoning 文本，供后续 prompt 复用。
-                # Important: <new_token_*> are latent action query tokens, not textual reasoning.
-                # Keep them out of response; the action prompt appends tokenizer.new_tokens later.
-                import re
-                response = str(response)
-                response = re.sub(r"<new_token_\\d+>", "", response)
-                response = response.replace("<new_token_0>", "").strip()
+                response = self.tokenizer.decode(output[0]).replace("<new_token_0>","")
                 print("====== Reasoning ======= >" + response)
                 self.last_response = response
             else:

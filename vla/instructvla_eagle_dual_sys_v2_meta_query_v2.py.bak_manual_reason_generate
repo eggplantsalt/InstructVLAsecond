@@ -644,30 +644,22 @@ class InstructVLA(nn.Module):
                 pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
                 
                 with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
-                    # V100 path: bypass HuggingFace generate(inputs_embeds + attention_mask),
-                    # which can trigger attention-mask shape mismatch, e.g. 298 vs 596.
-                    from scripts_vpi.instructvla_v100_utils import manual_greedy_generate
-
                     # 注意：这里使用 -10 作为占位 padding 的屏蔽条件（与本项目 tokenizer 流程一致）。
                     attention_mask = input_ids.ne(-10)
-
-                    token_ids, response = manual_greedy_generate(
-                        vlm=self.vlm,
+                    output: CausalLMOutputWithPast = self.vlm.generate(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         pixel_values=pixel_values,
-                        tokenizer=self.tokenizer,
                         max_new_tokens=50,
-                        verbose=False,
+                        # fast_loss_cal=False,
+                        output_hidden_states=False,
+                        return_dict_in_generate=False,
+                        # 命中停止词后提前结束，避免无效长输出。
+                        stopping_criteria=self.stopping_criteria
                     )
 
                 # 记录 reasoning 文本，供后续 prompt 复用。
-                # Important: <new_token_*> are latent action query tokens, not textual reasoning.
-                # Keep them out of response; the action prompt appends tokenizer.new_tokens later.
-                import re
-                response = str(response)
-                response = re.sub(r"<new_token_\\d+>", "", response)
-                response = response.replace("<new_token_0>", "").strip()
+                response = self.tokenizer.decode(output[0]).replace("<new_token_0>","")
                 print("====== Reasoning ======= >" + response)
                 self.last_response = response
             else:

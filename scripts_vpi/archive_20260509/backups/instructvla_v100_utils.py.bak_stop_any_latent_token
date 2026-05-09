@@ -210,22 +210,12 @@ def manual_greedy_generate(
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
         token_id = int(next_token[0, 0].item())
 
-        token_text = tokenizer.decode([token_id], skip_special_tokens=False)
-
-        # In InstructVLA, <new_token_*> are latent action query tokens.
-        # They mark the transition from textual response to latent action generation.
-        # Stop textual decoding here; the action prompt will append all latent tokens later.
-        if "<new_token_" in token_text:
-            if verbose:
-                print(f"[DEBUG] hit latent action token, stop textual decoding: {token_text!r}")
-            break
-
         new_token_ids.append(token_id)
 
         if verbose and step < 10:
             print(
                 f"[DEBUG] step={step}, token_id={token_id}, "
-                f"token={token_text!r}"
+                f"token={tokenizer.decode([token_id])!r}"
             )
 
         if token_id in eos_ids:
