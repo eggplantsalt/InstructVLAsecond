@@ -314,11 +314,42 @@ def main():
     meta = json.loads((episode_dir / "episode_meta.json").read_text(encoding="utf-8"))
     instruction = meta["instruction"]
 
-    frame_paths = [Path(p) for p in meta["frame_paths"]]
-    frame_paths = [p if p.is_absolute() else Path.cwd() / p for p in frame_paths]
+    raw_frame_paths = [Path(p) for p in meta["frame_paths"]]
+
+    resolved_frame_paths = []
+    for i, raw_p in enumerate(raw_frame_paths):
+        candidates = [
+            episode_dir / "frames" / f"frame_{i:03d}.png",
+            episode_dir / "frames" / raw_p.name,
+        ]
+
+        if raw_p.is_absolute():
+            candidates.append(raw_p)
+        else:
+            candidates.append(Path.cwd() / raw_p)
+            candidates.append(episode_dir / raw_p)
+
+        chosen = None
+        for c in candidates:
+            if c.exists():
+                chosen = c
+                break
+
+        if chosen is None:
+            raise FileNotFoundError(
+                "Could not resolve frame path for index "
+                f"{i}. raw_path={raw_p}. tried={[str(c) for c in candidates]}"
+            )
+
+        resolved_frame_paths.append(chosen)
+
+    frame_paths = resolved_frame_paths
 
     num_frames = min(args.num_frames, len(frame_paths), int(meta["num_saved_frames"]))
     frame_paths = frame_paths[:num_frames]
+
+    print("first resolved frame:", frame_paths[0])
+    print("last resolved frame:", frame_paths[-1])
 
     wrong_language = args.wrong_language
     if wrong_language is None:

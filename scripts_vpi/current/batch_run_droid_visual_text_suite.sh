@@ -22,6 +22,39 @@ RANDOM_TEXTS=(
 
 mkdir -p "$OUT_ROOT" "$LOG_DIR"
 
+is_eval_complete() {
+  local out_dir="$1"
+  local num_frames="$2"
+
+  [ -f "$out_dir/summary.json" ] || return 1
+  [ -f "$out_dir/main_conditions/summary.json" ] || return 1
+  [ -f "$out_dir/main_conditions/condition_summary.csv" ] || return 1
+  [ -f "$out_dir/extra_wrong_random/summary.json" ] || return 1
+  [ -f "$out_dir/extra_wrong_random/condition_summary.csv" ] || return 1
+
+  local dirs=(
+    "smallBottom_correctText"
+    "smallBottom_wrongText_00"
+    "smallBottom_wrongText_01"
+    "smallBottom_wrongText_02"
+    "smallBottom_wrongText_03"
+    "smallBottom_wrongText_04"
+    "smallBottom_randomText_00"
+    "smallBottom_randomText_01"
+    "smallBottom_randomText_02"
+  )
+
+  local d n
+  for d in "${dirs[@]}"; do
+    [ -d "$out_dir/images/$d" ] || return 1
+    n=$(find "$out_dir/images/$d" -maxdepth 1 -type f -name "frame_*.png" | wc -l)
+    [ "$n" -eq "$num_frames" ] || return 1
+  done
+
+  return 0
+}
+
+
 echo "Episodes: ${EPISODES[*]}"
 echo "EP_ROOT: $EP_ROOT"
 echo "OUT_ROOT: $OUT_ROOT"
@@ -36,13 +69,18 @@ for EP in "${EPISODES[@]}"; do
 
   if [ ! -f "$EP_DIR/episode_meta.json" ]; then
     echo "[ERROR] Missing prepared episode: $EP_DIR"
-    echo "Run: bash scripts_vpi/batch_prepare_droid100_uniform.sh $EP"
+    echo "Run: bash scripts_vpi/current/batch_prepare_droid100_uniform.sh $EP"
     exit 1
   fi
 
-  if [ "$FORCE" != "1" ] && [ -f "$OUT_DIR/summary.json" ]; then
-    echo "[SKIP] episode $EP already evaluated: $OUT_DIR"
+  if [ "$FORCE" != "1" ] && is_eval_complete "$OUT_DIR" "$NUM_FRAMES"; then
+    echo "[SKIP] episode $EP already evaluated and complete: $OUT_DIR"
     continue
+  fi
+
+  if [ "$FORCE" != "1" ] && [ -e "$OUT_DIR" ]; then
+    echo "[WARN] episode $EP output exists but is incomplete; removing and rerunning: $OUT_DIR"
+    rm -rf "$OUT_DIR"
   fi
 
   case "$EP" in
