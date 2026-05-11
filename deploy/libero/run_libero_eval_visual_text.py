@@ -104,13 +104,17 @@ class GenerateConfig:
     #################################################################################################################
     # Visual-text pilot parameters
     #################################################################################################################
-    eval_mode: str = "clean_langT_noText"             # clean_langT_noText | visualPrompt_noText | visualPrompt_textT | langT_textT
+    eval_mode: str = "clean_langT_noText"             # clean_langT_noText | visualPrompt_noText | visualPrompt_textT | langT_textT | langT_conflictText
     visual_prompt: str = "Follow the instruction shown in the image."
     overlay_view: str = "both"                        # full | wrist | both
     num_tasks_limit: int = -1                         # -1 means all tasks
     task_ids: str = ""                                # comma-separated task ids, e.g. "5" or "1,5,7"; overrides num_tasks_limit
     overlay_font_size: int = 14
     overlay_max_chars_per_line: int = 42
+    conflict_task_id: int = -1                    # for langT_conflictText: use this LIBERO task id as visual text; -1 means next task id
+    conflict_text_override: str = ""              # optional direct visual conflict text; overrides conflict_task_id
+    save_debug_frames: bool = True                # save first overlaid full/wrist observation frames for sanity check
+    debug_frame_dir: str = "outputs_vpi/libero_visual_text_pilot/debug_frames"
 
     # fmt: on
 
@@ -191,20 +195,83 @@ def draw_small_bottom_text(image, text, font_size=14, margin=4, max_chars_per_li
     return _restore_image_type(out, original_kind)
 
 
+def get_conflict_overlay_text(cfg, task_suite, task_id, task_description):
+    """Return the competing visual instruction text T' for langT_conflictText."""
+    override = str(getattr(cfg, "conflict_text_override", "")).strip()
+    if override:
+        return override
+
+    num_tasks = task_suite.n_tasks
+    conflict_task_id = int(getattr(cfg, "conflict_task_id", -1))
+
+    if conflict_task_id < 0:
+        conflict_task_id = (int(task_id) + 1) % num_tasks
+
+    if conflict_task_id < 0 or conflict_task_id >= num_tasks:
+        raise ValueError(f"conflict_task_id {conflict_task_id} out of range [0, {num_tasks - 1}]")
+
+    conflict_text = task_suite.get_task(conflict_task_id).language
+
+    if conflict_text == task_description:
+        raise ValueError(
+            f"Conflict text is identical to current task text. "
+            f"task_id={task_id}, conflict_task_id={conflict_task_id}, text={conflict_text!r}"
+        )
+
+    return conflict_text
+
+
+
 def get_model_instruction_for_mode(cfg, task_description):
-    if cfg.eval_mode in ("clean_langT_noText", "langT_textT"):
+    if cfg.eval_mode in ("clean_langT_noText", "langT_textT", "langT_conflictText"):
         return task_description
     if cfg.eval_mode in ("visualPrompt_noText", "visualPrompt_textT"):
         return cfg.visual_prompt
     raise ValueError(f"Unknown eval_mode: {cfg.eval_mode}")
 
 
-def get_overlay_text_for_mode(cfg, task_description):
+def get_overlay_text_for_mode(cfg, task_description, conflict_overlay_text=None):
     if cfg.eval_mode in ("langT_textT", "visualPrompt_textT"):
         return task_description
+    if cfg.eval_mode == "langT_conflictText":
+        if conflict_overlay_text is None or str(conflict_overlay_text).strip() == "":
+            raise ValueError("langT_conflictText requires non-empty conflict_overlay_text")
+        return conflict_overlay_text
     if cfg.eval_mode in ("clean_langT_noText", "visualPrompt_noText"):
         return None
     raise ValueError(f"Unknown eval_mode: {cfg.eval_mode}")
+
+
+def save_debug_observation_frames(cfg, run_id, task_id, episode_idx, img, wrist_img, overlay_text):
+    """Save first overlaid full and wrist frames for visual sanity checking."""
+    if not getattr(cfg, "save_debug_frames", True):
+        return
+
+    out_dir = Path(cfg.debug_frame_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_run_id = str(run_id).replace("/", "_")
+    prefix = out_dir / f"{safe_run_id}--task={int(task_id):02d}--episode={int(episode_idx)+1:03d}"
+
+    full_path = str(prefix) + "--full.png"
+    wrist_path = str(prefix) + "--wrist.png"
+    meta_path = str(prefix) + "--meta.txt"
+
+    Image.fromarray(np.asarray(img).astype(np.uint8)).save(full_path)
+    Image.fromarray(np.asarray(wrist_img).astype(np.uint8)).save(wrist_path)
+
+    with open(meta_path, "w") as f:
+        f.write(f"run_id: {run_id}\n")
+        f.write(f"task_id: {task_id}\n")
+        f.write(f"episode_idx: {episode_idx}\n")
+        f.write(f"eval_mode: {cfg.eval_mode}\n")
+        f.write(f"overlay_text: {overlay_text}\n")
+        f.write(f"overlay_view: {cfg.overlay_view}\n")
+        f.write(f"overlay_font_size: {cfg.overlay_font_size}\n")
+
+    print(f"[debug] saved overlaid full frame: {full_path}")
+    print(f"[debug] saved overlaid wrist frame: {wrist_path}")
+
 
 
 def maybe_apply_overlay(cfg, img, wrist_img, overlay_text):
@@ -330,7 +397,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
         model_instruction = get_model_instruction_for_mode(cfg, task_description)
-        overlay_text = get_overlay_text_for_mode(cfg, task_description)
+        conflict_overlay_text = None
+        if cfg.eval_mode == "langT_conflictText":
+            conflict_overlay_text = get_conflict_overlay_text(cfg, task_suite, task_id, task_description)
+        overlay_text = get_overlay_text_for_mode(cfg, task_description, conflict_overlay_text)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -339,10 +409,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
             print(f"Eval mode: {cfg.eval_mode}")
             print(f"Model instruction: {model_instruction}")
             print(f"Overlay text: {overlay_text}")
+            if cfg.eval_mode == "langT_conflictText":
+                print(f"Conflict overlay candidate: {conflict_overlay_text}")
             log_file.write(f"\nTask: {task_description}\n")
             log_file.write(f"Eval mode: {cfg.eval_mode}\n")
             log_file.write(f"Model instruction: {model_instruction}\n")
             log_file.write(f"Overlay text: {overlay_text}\n")
+            if cfg.eval_mode == "langT_conflictText":
+                log_file.write(f"Conflict overlay candidate: {conflict_overlay_text}\n")
 
             # Reset environment
             env.reset()
@@ -353,6 +427,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             # Setup
             t = 0
             replay_images = []
+            saved_debug_frame_for_episode = False
             if cfg.task_suite_name == "libero_spatial":
                 max_steps = 220  # longest training demo has 193 steps
             elif cfg.task_suite_name == "libero_object":
@@ -381,6 +456,19 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                 # Apply visual text overlay before both replay saving and model inference.
                 img, wrist_img = maybe_apply_overlay(cfg, img, wrist_img, overlay_text)
+
+                # Save the first actual model-input frame for sanity checking.
+                if not saved_debug_frame_for_episode:
+                    save_debug_observation_frames(
+                        cfg,
+                        run_id,
+                        task_id,
+                        episode_idx,
+                        img,
+                        wrist_img,
+                        overlay_text,
+                    )
+                    saved_debug_frame_for_episode = True
 
                 # Save preprocessed image for replay video
                 replay_images.append(img)
