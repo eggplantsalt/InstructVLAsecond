@@ -143,11 +143,11 @@ from .action_head import ActionModel
 class InstructVLA(nn.Module):
     def __init__(
         self,
-        vlm: AutoModel,from PIL import Image
+        vlm: AutoModel,
         processor: AutoProcessor = None,
         tokenizer: AutoTokenizer = None,
         token_size: int = 4096,
-        action_dim: int = 7,from PIL import Image
+        action_dim: int = 7,
         future_action_window_size: int = 7,
         past_action_window_size: int = 1,
         norm_stats: Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]] = None,

@@ -167,3 +167,21 @@ ckpt/
 asset/
 
 outputs_vpi/
+
+
+*.bak*
+*.bak_*
+
+models/
+
+# Local LIBERO installation and rollout artifacts
+LIBERO/
+Libero/
+
+# Local experiment artifacts
+models/
+outputs_vpi/
+
+# Backup files
+*.bak*
+*.bak_*
